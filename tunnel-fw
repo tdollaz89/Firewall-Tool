@@ -1,0 +1,2045 @@
+#!/usr/bin/env python3
+"""
+tunnel-fw - nftables builder for two-hop tunnel setups:
+
+    clients ──client tunnel──▶ FE (ingress) ══transport tunnel══▶ GW (gateway)
+
+  client tunnel     what the clients build to the gateway; it rides inside the transport tunnel
+  transport tunnel  the FE <-> gateway link that carries client traffic
+
+Each tunnel can be WireGuard or OpenVPN, in any combination (WireGuard over
+OpenVPN, OpenVPN over WireGuard, WireGuard over WireGuard, OpenVPN over OpenVPN),
+and either end of a transport tunnel can be the listening side. One gateway can be
+fed by several FEs, each with its own transport tunnel, and can host several client
+tunnels (e.g. one per FE leg).
+
+Run it on each server. It asks what role the box plays and which ports/services
+to keep open, then writes /etc/nftables.conf, applies it with an automatic
+rollback guard, enables it at boot, and clears stale NAT conntrack state.
+
+Commands:
+  setup      interactive wizard (default)      tunnel-fw setup [--dry-run]
+  apply      re-apply from saved config         tunnel-fw apply [--yes]
+  render     print the ruleset for the config   tunnel-fw render
+  doctor     health-check the tunnel path       tunnel-fw doctor [--fix]
+
+Multiple FEs feeding one gateway (run on the gateway):
+  add-fe     add another FE's transport tunnel  tunnel-fw add-fe [--name fe2 --dev fe2 ...]
+  remove-fe  drop an FE's transport tunnel      tunnel-fw remove-fe fe2
+  list-fe    show transports + active clients   tunnel-fw list-fe
+  join-nets  let clients on every FE's subnet   tunnel-fw join-nets 172.23.1.0/24,172.23.2.0/24
+             reach each other (--off to undo)
+
+Stdlib only; needs root for everything except `render` and `--dry-run`.
+"""
+
+import argparse
+import datetime
+import difflib
+import glob
+import ipaddress
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+VERSION = "1.8.0"
+CONFIG_PATH = "/etc/tunnel-fw/config.json"
+NFT_CONF = "/etc/nftables.conf"
+STATE_DIR = "/var/lib/tunnel-fw"
+SYSCTL_CONF = "/etc/sysctl.d/99-sysctl.conf"      # Debian/Ubuntu: symlink to /etc/sysctl.conf
+LEGACY_SYSCTL_FILE = "/etc/sysctl.d/90-tunnel-fw.conf"  # written by versions before 1.6
+DEFAULT_EGRESS = "udp/53, udp/123, tcp/80, tcp/443"
+KEEP_BACKUPS = 10
+TYPES = ("wireguard", "openvpn")
+LISTENERS = ("fe", "gw", "both")
+
+# --------------------------------------------------------------------------- output
+
+TTY = sys.stdout.isatty()
+
+
+def color(code, s):
+    return f"\033[{code}m{s}\033[0m" if TTY else s
+
+
+def head(s):
+    print("\n" + color("1;36", f"== {s}"))
+
+
+def info(s):
+    print(color("36", "  ::") + " " + s)
+
+
+def ok(s):
+    print(color("32", "  ✓") + " " + s)
+
+
+def warn(s):
+    print(color("33", "  !") + " " + s)
+
+
+def bad(s):
+    print(color("31", "  ✗") + " " + s)
+
+
+def die(s, code=1):
+    sys.stdout.flush()
+    print(color("31", "error: ") + s, file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd, inp=None):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, input=inp)
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]}: command not found"
+    return p.returncode, p.stdout, p.stderr
+
+
+def need_root(what):
+    if os.geteuid() != 0:
+        die(f"{what} needs root (try: sudo tunnel-fw ...)")
+
+
+def other_role(role):
+    return "gw" if role == "fe" else "fe"
+
+
+# --------------------------------------------------------------------------- specs
+# Port spec syntax, used everywhere a port list is asked for:
+#   tcp/22                 single port
+#   tcp/8000-8100          range
+#   tcp/22@203.0.113.0/24  only from that source
+#   udp/51820:11223        (forwards only) public port 51820 -> gateway port 11223
+#   tcp/20022=CUSTOM-SSH   (open ports only) label, used as the rule's comment
+
+SPEC_RE = re.compile(
+    r"^(tcp|udp)/(\d{1,5})(?:-(\d{1,5}))?(?::(\d{1,5}))?(?:@([^=\s]+))?(?:=([A-Za-z0-9_.-]{1,64}))?$", re.I)
+IFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,15}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
+
+
+def _port(v):
+    p = int(v)
+    if not 1 <= p <= 65535:
+        raise ValueError(f"port {p} out of range")
+    return p
+
+
+def parse_spec(text, kind="service"):
+    m = SPEC_RE.match(text.strip())
+    if not m:
+        raise ValueError(f"can't parse '{text}' (expected e.g. tcp/22, udp/11223)")
+    proto, p1, p2, to, src, label = m.groups()
+    d = {"proto": proto.lower(), "port": _port(p1)}
+    if p2:
+        if kind == "forward":
+            raise ValueError("forwards take a single port, not a range")
+        d["port_end"] = _port(p2)
+        if d["port_end"] <= d["port"]:
+            raise ValueError(f"bad range in '{text}'")
+    if to:
+        if kind != "forward":
+            raise ValueError(f"':' (port remap) only applies to forwards: '{text}'")
+        d["to_port"] = _port(to)
+    elif kind == "forward":
+        d["to_port"] = d["port"]
+    if src:
+        if kind != "service":
+            raise ValueError(f"'@source' only applies to open services: '{text}'")
+        d["src"] = str(ipaddress.ip_network(src, strict=False))
+    if label:
+        if kind != "service":
+            raise ValueError(f"'=label' only applies to open services: '{text}'")
+        d["comment"] = label
+    return d
+
+
+def parse_list(text, kind="service"):
+    text = text.strip()
+    if text.lower() in ("", "none", "-"):
+        return []
+    out = [parse_spec(t, kind) for t in re.split(r"[,\s]+", text) if t]
+    seen, uniq = set(), []
+    for d in out:
+        k = json.dumps(d, sort_keys=True)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(d)
+    return uniq
+
+
+def spec_str(d):
+    s = f"{d['proto']}/{d['port']}"
+    if d.get("port_end"):
+        s += f"-{d['port_end']}"
+    if d.get("to_port") and d["to_port"] != d["port"]:
+        s += f":{d['to_port']}"
+    if d.get("src"):
+        s += f"@{d['src']}"
+    if d.get("comment"):
+        s += f"={d['comment']}"
+    return s
+
+
+def merge_services(lst):
+    """One entry per port (same proto/port/range/source); keep the first label seen."""
+    out, idx = [], {}
+    for d in lst:
+        k = (d["proto"], d["port"], d.get("port_end"), d.get("src"))
+        if k in idx:
+            if d.get("comment") and not out[idx[k]].get("comment"):
+                out[idx[k]]["comment"] = d["comment"]
+        else:
+            idx[k] = len(out)
+            out.append(dict(d))
+    return out
+
+
+def list_str(lst):
+    return ", ".join(spec_str(d) for d in lst) or "none"
+
+
+def v_iface(a):
+    if not IFACE_RE.match(a):
+        raise ValueError(f"'{a}' is not a valid interface name")
+    if not os.path.exists(f"/sys/class/net/{a}"):
+        warn(f"interface {a} does not exist right now (fine if its tunnel is down)")
+    return a
+
+
+def v_ip4(a):
+    return str(ipaddress.IPv4Address(a))
+
+
+def v_ip4_or_any(a):
+    return None if a.lower() in ("any", "none") else v_ip4(a)
+
+
+def v_net4(a):
+    return str(ipaddress.IPv4Network(a, strict=False))
+
+
+def v_join_nets(a):
+    nets = []
+    for part in [x.strip() for x in a.replace(" ", ",").split(",") if x.strip()]:
+        if "/" not in part:
+            raise ValueError(f"{part}: add the mask, e.g. {part}/24")
+        try:
+            n = v_net4(part)
+        except ValueError:
+            raise ValueError(f"{part} is not an IPv4 network")
+        if n not in nets:
+            nets.append(n)
+    if not nets:
+        raise ValueError("give at least one subnet")
+    return nets
+
+
+def v_name(a):
+    if not NAME_RE.match(a):
+        raise ValueError("names are 1-32 chars of letters, digits, . _ -")
+    return a
+
+
+def v_type(a):
+    a = a.lower()
+    a = {"wg": "wireguard", "ovpn": "openvpn"}.get(a, a)
+    if a not in TYPES:
+        raise ValueError("type is wireguard (wg) or openvpn (ovpn)")
+    return a
+
+
+def v_listener(a):
+    if a.lower() not in LISTENERS:
+        raise ValueError("answer fe, gw or both")
+    return a.lower()
+
+
+def v_forwards(a):
+    fw = parse_list(a, "forward")
+    if not fw:
+        raise ValueError("an FE needs at least one port to forward (the client tunnel's port)")
+    return fw
+
+
+def v_tunnel_port(ttype):
+    """proto/port for a tunnel; WireGuard is UDP only (a bare number is accepted)."""
+    def v(a):
+        if a.isdigit():
+            a = f"udp/{a}"
+        d = parse_spec(a, kind="egress")
+        if d.get("port_end"):
+            raise ValueError("a tunnel needs a single port")
+        if ttype == "wireguard" and d["proto"] != "udp":
+            raise ValueError("WireGuard is UDP only")
+        return d
+    return v
+
+
+# --------------------------------------------------------------------------- prompts
+
+_EOF = False
+
+
+def ask(q, default=None, validate=None):
+    global _EOF
+    while True:
+        sfx = f" [{default}]" if default not in (None, "") else ""
+        if _EOF:
+            a = ""
+            print(f"  {q}: {default} (auto)")
+        else:
+            try:
+                a = input(f"  {color('1', q)}{sfx}: ").strip()
+            except EOFError:
+                _EOF = True
+                print()
+                a = ""
+        if not a and default is not None:
+            a = str(default)
+        if not a and default is None:
+            if _EOF:
+                die(f"no answer for '{q}' and stdin is closed")
+            warn("an answer is required")
+            continue
+        if validate:
+            try:
+                return validate(a)
+            except ValueError as e:
+                warn(str(e))
+                if _EOF:
+                    die("invalid default with stdin closed")
+                continue
+        return a
+
+
+def ask_yn(q, default=True):
+    def v(a):
+        a = a.lower()
+        if a in ("y", "yes"):
+            return True
+        if a in ("n", "no"):
+            return False
+        raise ValueError("answer y or n")
+    return ask(q, "Y/n" if default else "y/N",
+               lambda a: default if a in ("Y/n", "y/N") else v(a))
+
+
+def ask_choice(q, choices, default):
+    def v(a):
+        if a not in choices:
+            raise ValueError(f"choose one of: {', '.join(choices)}")
+        return a
+    return ask(f"{q} ({'/'.join(choices)})", default, v)
+
+
+# --------------------------------------------------------------------------- detection
+# Every tunnel found on the host becomes a dict with (when known):
+#   type, dev, file, proto, port, local_ip, peer_ip, subnet,
+#   listens / connects  - does THIS host accept / initiate the tunnel
+#   multi               - many clients (looks like a client-facing "client_tunnel" server)
+#   remote_ip           - address this host connects to
+#   seen_ip             - address a peer was last seen connecting from
+#   status_file         - OpenVPN status file (client list for doctor)
+
+def default_route_iface():
+    rc, out, _ = run(["ip", "-j", "route", "show", "default"])
+    try:
+        return json.loads(out)[0]["dev"]
+    except (ValueError, IndexError, KeyError):
+        return None
+
+
+def iface_v4(dev):
+    """-> (local, peer_or_None, prefixlen) for the first IPv4 address on dev."""
+    rc, out, _ = run(["ip", "-j", "-4", "addr", "show", "dev", dev])
+    try:
+        for a in json.loads(out)[0].get("addr_info", []):
+            return a["local"], a.get("address"), a.get("prefixlen")
+    except (ValueError, IndexError, KeyError):
+        pass
+    return None, None, None
+
+
+def resolve4(host):
+    try:
+        return v_ip4(host)
+    except ValueError:
+        try:
+            return socket.gethostbyname(host)
+        except (OSError, UnicodeError):
+            return None
+
+
+def parse_endpoint(ep):
+    if not ep or ep == "(none)":
+        return None, None
+    host, _, port = ep.rpartition(":")
+    return resolve4(host.strip("[]")), (int(port) if port.isdigit() else None)
+
+
+def openvpn_peer_from_logs():
+    """Last client address seen in OpenVPN logs."""
+    last = None
+    for f in glob.glob("/etc/openvpn/*.log") + glob.glob("/etc/openvpn/*/*.log") + glob.glob("/var/log/openvpn/*.log"):
+        try:
+            for m in re.finditer(r"\[AF_INET\](\d+\.\d+\.\d+\.\d+):\d+", open(f, errors="replace").read()):
+                last = m.group(1)
+        except OSError:
+            pass
+    return last
+
+
+def parse_openvpn(path):
+    try:
+        text = open(path).read()
+    except OSError:
+        return None
+    d = {"type": "openvpn", "file": path, "proto": "udp", "port": 1194, "mode": "server"}
+    block = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if block:
+            if line.lower() == f"</{block}>":
+                block = None
+            continue
+        m = re.match(r"^<([a-z0-9-]+)>$", line, re.I)
+        if m:
+            block = m.group(1).lower()
+            continue
+        if not line or line[0] in "#;":
+            continue
+        k, *args = line.split()
+        k = k.lower()
+        if k == "dev" and args:
+            d["dev"] = args[0]
+        elif k in ("port", "lport", "rport") and args and args[0].isdigit():
+            d["port"] = int(args[0])
+        elif k == "proto" and args:
+            d["proto"] = "udp" if args[0].lower().startswith("udp") else "tcp"
+        elif k == "remote" and args:
+            d["mode"] = "client"
+            d["remote"] = args[0]
+            if len(args) > 1 and args[1].isdigit():
+                d["remote_port"] = int(args[1])
+            if len(args) > 2:
+                d["proto"] = "udp" if args[2].lower().startswith("udp") else "tcp"
+        elif k in ("client", "tls-client"):
+            d["mode"] = "client"
+        elif k == "ifconfig" and len(args) >= 2:
+            d["local_ip"], d["peer_ip"] = args[0], args[1]
+        elif k == "server" and len(args) >= 2:
+            d["multi"] = True
+            try:
+                d["subnet"] = str(ipaddress.IPv4Network(f"{args[0]}/{args[1]}", strict=False))
+            except ValueError:
+                pass
+        elif k == "status" and args:
+            d["status_file"] = args[0] if os.path.isabs(args[0]) else os.path.join(os.path.dirname(path), args[0])
+    if "remote_port" in d:
+        d["port"] = d["remote_port"]
+    if d.get("remote"):
+        d["remote_ip"] = resolve4(d["remote"])
+    d["listens"] = d["mode"] == "server"
+    d["connects"] = d["mode"] == "client"
+    if "local_ip" not in d and d.get("dev"):
+        local, peer, plen = iface_v4(d["dev"])
+        if local:
+            d["local_ip"] = local
+            if peer and peer != local:
+                d["peer_ip"] = peer
+    return d
+
+
+def parse_wireguard(dev):
+    d = {"type": "wireguard", "dev": dev, "proto": "udp", "file": f"/etc/wireguard/{dev}.conf"}
+    peers, listen, addrs, have_conf = [], None, [], False
+    try:
+        sect = None
+        with open(d["file"]) as fh:
+            for raw in fh:
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                if line.startswith("["):
+                    sect = line.strip("[] ").lower()
+                    if sect == "peer":
+                        peers.append({})
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip().lower(), v.strip()
+                if sect == "interface":
+                    if k == "listenport" and v.isdigit():
+                        listen = int(v)
+                    elif k == "address":
+                        addrs += [x.strip() for x in v.split(",")]
+                elif sect == "peer" and peers:
+                    if k == "endpoint":
+                        peers[-1]["endpoint"] = v
+                    elif k == "allowedips":
+                        peers[-1]["allowed"] = v
+        have_conf = True
+    except OSError:
+        d["file"] = None
+    rc, out, _ = run(["wg", "show", dev, "dump"])
+    live = [l.split("\t") for l in out.strip().splitlines()] if rc == 0 and out.strip() else []
+    if not have_conf and live:
+        if len(live[0]) > 2 and live[0][2].isdigit() and live[0][2] != "0":
+            listen = int(live[0][2])
+        peers = [{"allowed": p[3]} for p in live[1:] if len(p) > 3]
+    seen = [ip for ip in (parse_endpoint(p[2])[0] for p in live[1:] if len(p) > 2) if ip]
+
+    for a in addrs:
+        try:
+            i = ipaddress.ip_interface(a)
+        except ValueError:
+            continue
+        if i.version == 4:
+            d["local_ip"], d["subnet"] = str(i.ip), str(i.network)
+            break
+    if "local_ip" not in d:
+        local, _, plen = iface_v4(dev)
+        if local:
+            d["local_ip"] = local
+            if plen:
+                d["subnet"] = str(ipaddress.ip_interface(f"{local}/{plen}").network)
+
+    endpoints = [parse_endpoint(p["endpoint"]) for p in peers if p.get("endpoint")]
+    d["peer_count"] = len(peers)
+    d["multi"] = len(peers) >= 2
+    d["connects"] = bool(endpoints)
+    d["listens"] = listen is not None
+    if len(peers) == 1:
+        for a in (peers[0].get("allowed") or "").split(","):
+            try:
+                n = ipaddress.ip_network(a.strip(), strict=False)
+            except ValueError:
+                continue
+            if n.version == 4 and n.prefixlen == 32:
+                d["peer_ip"] = str(n.network_address)
+                break
+        if endpoints:
+            d["remote_ip"], d["remote_port"] = endpoints[0]
+        if seen:
+            d["seen_ip"] = seen[0]
+    if d["listens"]:
+        d["port"] = listen
+    elif d.get("remote_port"):
+        d["port"] = d["remote_port"]
+    return d
+
+
+def detect_tunnels():
+    out = []
+    confs = sorted(set(glob.glob("/etc/openvpn/*.conf") + glob.glob("/etc/openvpn/server/*.conf")
+                       + glob.glob("/etc/openvpn/client/*.conf")))
+    for f in confs:
+        o = parse_openvpn(f)
+        if o:
+            out.append(o)
+    names = []
+    rc, js, _ = run(["ip", "-j", "-d", "link", "show", "type", "wireguard"])
+    try:
+        names = [l["ifname"] for l in json.loads(js) if l.get("ifname")]
+    except ValueError:
+        pass
+    for f in sorted(glob.glob("/etc/wireguard/*.conf")):
+        n = os.path.basename(f)[:-5]
+        if n not in names:
+            names.append(n)
+    out += [parse_wireguard(n) for n in names]
+    return out
+
+
+def tunnel_str(t):
+    bits = [t["type"], t.get("dev", "?")]
+    if t["type"] == "openvpn":
+        bits.append(f"({t['mode']}{', multi-client' if t.get('multi') else ''})")
+    else:
+        role = "/".join(x for x, on in (("listens", t.get("listens")), ("connects", t.get("connects"))) if on)
+        bits.append(f"({t.get('peer_count', 0)} peer(s){', ' + role if role else ''})")
+    if t.get("port"):
+        bits.append(f"{t.get('proto', 'udp')}/{t['port']}")
+    if t.get("local_ip"):
+        bits.append(f"{t['local_ip']}" + (f" <-> {t['peer_ip']}" if t.get("peer_ip") else ""))
+    if t.get("multi") and t.get("subnet"):
+        bits.append(f"subnet {t['subnet']}")
+    if t.get("remote_ip"):
+        bits.append(f"-> {t['remote_ip']}")
+    return " ".join(bits)
+
+
+def transport_view(t, role):
+    """Defaults for a transport tunnel question, from a detected tunnel, seen from `role`."""
+    d = {k: t[k] for k in ("type", "dev", "proto", "port", "local_ip", "peer_ip") if t.get(k) is not None}
+    lis, con = t.get("listens"), t.get("connects")
+    if lis or con:
+        d["listener"] = "both" if lis and con else role if lis else other_role(role)
+    pub = t.get("remote_ip") or t.get("seen_ip")
+    if not pub and t["type"] == "openvpn" and lis:
+        pub = openvpn_peer_from_logs()
+    if pub:
+        d["peer_public_ip"] = pub
+    return d
+
+
+def client_tunnel_view(t):
+    return {k: t[k] for k in ("type", "dev", "proto", "port", "subnet", "status_file") if t.get(k) is not None}
+
+
+def detect_listening():
+    rc, out, _ = run(["ss", "-Hlntup"])
+    res = {}
+    for line in out.splitlines():
+        cols = line.split()
+        if len(cols) < 5 or cols[0] not in ("tcp", "udp"):
+            continue
+        addr, _, port = cols[4].rpartition(":")
+        addr = addr.strip("[]").split("%")[0]
+        if addr.startswith("127.") or addr == "::1" or not port.isdigit():
+            continue
+        m = re.search(r'\(\("([^"]+)"', line)
+        res.setdefault((cols[0], int(port)), m.group(1) if m else "?")
+    return res
+
+
+def detect_dhcp():
+    """Best guess whether this server gets its IPv4 address by DHCP (the default for the DHCP question)."""
+    if glob.glob("/run/systemd/netif/leases/*"):
+        return True
+    for f in glob.glob("/run/systemd/network/*.network") + glob.glob("/etc/systemd/network/*.network"):
+        try:
+            if re.search(r"(?mi)^\s*DHCP\s*=\s*(yes|true|ipv4|both)\s*$", open(f).read()):
+                return True
+        except OSError:
+            pass
+    try:
+        if re.search(r"(?m)^\s*iface\s+\S+\s+inet\s+dhcp", open("/etc/network/interfaces").read()):
+            return True
+    except OSError:
+        pass
+    return run(["pgrep", "-x", "dhclient|dhcpcd"])[0] == 0
+
+
+def detect_ssh_ports():
+    ports = set()
+    sc = os.environ.get("SSH_CONNECTION", "").split()
+    if len(sc) == 4 and sc[3].isdigit():
+        ports.add(int(sc[3]))
+    rc, out, _ = run(["ss", "-Htnp", "state", "established"])
+    for line in out.splitlines():
+        if '"sshd' in line:
+            cols = line.split()
+            if len(cols) >= 3:
+                p = cols[2].rpartition(":")[2]
+                if p.isdigit():
+                    ports.add(int(p))
+    return ports
+
+
+def detect_current_open():
+    """Ports accepted (unconditionally) by an existing inet filter input chain."""
+    rc, out, _ = run(["nft", "list", "chain", "inet", "filter", "input"])
+    found = []
+    for line in out.splitlines():
+        if "accept" not in line or any(x in line for x in ("iifname", "saddr", "sport")):
+            continue
+        m = re.search(r"\b(tcp|udp) dport (\d+)(?:-(\d+))?\b", line)
+        if m:
+            d = {"proto": m.group(1), "port": int(m.group(2))}
+            if m.group(3):
+                d["port_end"] = int(m.group(3))
+            c = re.search(r'comment "([A-Za-z0-9_.-]{1,64})"', line)
+            if c:
+                d["comment"] = c.group(1)
+            found.append(d)
+    return found
+
+
+def detect():
+    return {"wan_if": default_route_iface(), "listening": detect_listening(), "dhcp": detect_dhcp(),
+            "ssh_ports": detect_ssh_ports(), "current_open": detect_current_open(),
+            "tunnels": detect_tunnels()}
+
+
+# --------------------------------------------------------------------------- config
+# {
+#   "role": "fe" | "gw", "wan_if": "eth0",
+#   "transports": [{"name" (tunnel name, e.g. river), "type", "dev", "proto", "port", "listener": fe|gw|both,
+#               "local_ip", "peer_ip", "peer_public_ip"? (gateway only: the FE's public IP)}],  # FE: exactly one
+#   "forwards": [{"proto", "port", "to_port"}],                   # FE only
+#   "client_tunnels": [{"name" (e.g. salmon), "type", "dev", "proto", "port", "subnet", "status_file"?,
+#              "only_via_transport", "via": [transport tunnel names its clients come in through]}],  # GW only
+#   "services": [...], "egress": [...], "policy": "accept" | "drop", "log": bool,
+#   "dhcp": bool  (add DHCP client rules; only needed if the server gets its address by DHCP)
+#   "join_nets": ["172.23.1.0/24", ...]?  (gateway only: client subnets allowed to reach each other)
+# }
+
+def transport_listens(role, r):
+    return r["listener"] in (role, "both")
+
+
+def transport_connects(role, r):
+    return r["listener"] in (other_role(role), "both")
+
+
+def load_config(path):
+    try:
+        with open(path) as f:
+            cfg = normalize_config(json.load(f))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        die(f"can't read {path}: {e}")
+    validate_config(cfg, path)
+    return cfg
+
+
+def normalize_config(cfg):
+    """Upgrade older configs. The transport tunnel was called `river`/`rivers` (v1.0-1.2) and
+    `backhauls` (v1.3); the client tunnel was `wg` (v1.0/1.1, WireGuard only) and `salmon` (v1.2).
+    v1.0 had a single river; v1.0/1.1 rivers were OpenVPN-only with the FE listening."""
+    if not isinstance(cfg, dict):
+        return cfg
+    role = cfg.get("role")
+    if "river" in cfg and "rivers" not in cfg:
+        cfg["rivers"] = [cfg.pop("river")]
+    for old in ("rivers", "backhauls"):
+        if old in cfg and "transports" not in cfg:
+            cfg["transports"] = cfg.pop(old)
+    if "salmon" in cfg and "client_tunnel" not in cfg:
+        cfg["client_tunnel"] = cfg.pop("salmon")
+    ct = cfg.get("client_tunnel") or cfg.get("wg")
+    for old in ("only_via_river", "only_via_backhaul"):
+        if isinstance(ct, dict) and old in ct:
+            ct.setdefault("only_via_transport", ct.pop(old))
+    for i, r in enumerate(cfg.get("transports") or []):
+        if not isinstance(r, dict):
+            continue
+        r.setdefault("name", "gw" if role == "fe" else f"fe{i + 1}")
+        r.setdefault("type", "openvpn")
+        r.setdefault("listener", "fe")
+        pub = r.pop("fe_public_ip", None) or r.pop("client_ip", None)
+        if pub and "peer_public_ip" not in r:
+            r["peer_public_ip"] = pub
+    if "wg" in cfg and "client_tunnel" not in cfg:
+        s = cfg.pop("wg")
+        s.setdefault("type", "wireguard")
+        s.setdefault("proto", "udp")
+        cfg["client_tunnel"] = s
+    # v1.0-1.7: one `client_tunnel` -> list `client_tunnels` (no `via` = every transport tunnel carries it)
+    if isinstance(cfg.get("client_tunnel"), dict) and "client_tunnels" not in cfg:
+        cfg["client_tunnels"] = [cfg.pop("client_tunnel")]
+    for ct in cfg.get("client_tunnels") or []:
+        if isinstance(ct, dict):
+            ct.setdefault("name", ct.get("dev", "client"))
+            # v1.0-1.5 options removed in 1.6: the gateway no longer forwards or trusts the client interface
+            for old in ("trust_clients", "route_clients", "client_to_client"):
+                ct.pop(old, None)
+    if role == "fe":
+        # v1.6: an FE never needs the gateway's public IP
+        for r in cfg.get("transports") or []:
+            if isinstance(r, dict):
+                r.pop("peer_public_ip", None)
+    # v1.0-1.4: `log_only` flag + optional outbound chain -> `policy` + always-on outbound chain
+    cfg.setdefault("dhcp", True)  # before 1.6 the DHCP rules were always written
+    log_only = cfg.pop("log_only", None)
+    cfg.setdefault("policy", "accept" if log_only else "drop")
+    if not cfg.pop("restrict_egress", True) or "egress" not in cfg:
+        cfg.setdefault("egress", parse_list(DEFAULT_EGRESS, "egress"))
+    return cfg
+
+
+def validate_config(cfg, where="config"):
+    try:
+        role = cfg["role"]
+        assert role in ("fe", "gw"), "role must be fe or gw"
+        assert cfg["policy"] in ("accept", "drop"), "policy must be accept or drop"
+        assert IFACE_RE.match(cfg["wan_if"]), "bad wan_if"
+        if cfg.get("join_nets"):
+            assert role == "gw", "join_nets is a gateway setting"
+            v_join_nets(",".join(cfg["join_nets"]))
+        transports = cfg["transports"]
+        assert isinstance(transports, list) and transports, "need at least one transport tunnel"
+        if role == "fe":
+            assert len(transports) == 1, "an FE has exactly one transport tunnel (to its gateway)"
+        for r in transports:
+            n = r["name"]
+            assert NAME_RE.match(n), f"bad transport tunnel name {n!r}"
+            assert r["type"] in TYPES, f"transport tunnel {n}: type must be wireguard or openvpn"
+            assert IFACE_RE.match(r["dev"]), f"transport tunnel {n}: bad dev {r['dev']!r}"
+            assert r["proto"] in ("tcp", "udp"), f"transport tunnel {n}: proto must be tcp/udp"
+            assert r["type"] != "wireguard" or r["proto"] == "udp", f"transport tunnel {n}: WireGuard is UDP only"
+            assert r["listener"] in LISTENERS, f"transport tunnel {n}: listener must be fe, gw or both"
+            _port(r["port"])
+            v_ip4(r["local_ip"])
+            v_ip4(r["peer_ip"])
+            assert r["local_ip"] != r["peer_ip"], f"transport tunnel {n}: local and peer IP are the same"
+            if r.get("peer_public_ip"):
+                v_ip4(r["peer_public_ip"])
+            elif role == "gw" and transport_connects(role, r):
+                raise AssertionError(f"transport tunnel {n}: this {role} connects out to the {other_role(role)}, "
+                                     "so peer_public_ip (its public IP) is required")
+        for key in ("name", "dev", "local_ip", "peer_ip"):
+            vals = [r[key] for r in transports]
+            dup = sorted({v for v in vals if vals.count(v) > 1})
+            assert not dup, (f"transport tunnel {key} must be unique per FE (duplicated: {', '.join(dup)}) - "
+                             "each FE's transport tunnel needs its own tunnel addresses or replies go out the wrong transport tunnel")
+        listen_ports = [(r["proto"], r["port"]) for r in transports if transport_listens(role, r)]
+        dup = {p for p in listen_ports if listen_ports.count(p) > 1}
+        assert not dup, f"two transport tunnels listen on the same port: {', '.join(f'{a}/{b}' for a, b in dup)}"
+        if role == "gw":
+            cts = cfg["client_tunnels"]
+            assert isinstance(cts, list) and cts, "need at least one client tunnel"
+            tnames = [r["name"] for r in transports]
+            for s in cts:
+                n = s.get("name")
+                assert NAME_RE.match(n or ""), f"bad client tunnel name {n!r}"
+                assert s["type"] in TYPES, f"client tunnel {n}: type must be wireguard or openvpn"
+                assert IFACE_RE.match(s["dev"]), f"client tunnel {n}: bad dev {s['dev']!r}"
+                assert s["proto"] in ("tcp", "udp"), f"client tunnel {n}: proto must be tcp/udp"
+                assert s["type"] != "wireguard" or s["proto"] == "udp", f"client tunnel {n}: WireGuard is UDP only"
+                _port(s["port"])
+                v_net4(s["subnet"])
+                assert s["dev"] not in [r["dev"] for r in transports], f"client tunnel {n} and a transport tunnel share an interface"
+                assert (s["proto"], s["port"]) not in listen_ports, f"client tunnel {n} and a transport tunnel listen on the same port"
+                if "via" in s:
+                    assert isinstance(s["via"], list) and s["via"], f"client tunnel {n}: via needs at least one transport tunnel"
+                    bad_via = [v for v in s["via"] if v not in tnames]
+                    assert not bad_via, f"client tunnel {n}: via {', '.join(bad_via)} - no such transport tunnel"
+            for key in ("name", "dev"):
+                vals = [c[key] for c in cts]
+                dup = sorted({v for v in vals if vals.count(v) > 1})
+                assert not dup, f"client tunnel {key} must be unique (duplicated: {', '.join(dup)})"
+            cports = [(c["proto"], c["port"]) for c in cts]
+            dup = {p for p in cports if cports.count(p) > 1}
+            assert not dup, f"two client tunnels listen on the same port: {', '.join(f'{a}/{b}' for a, b in dup)}"
+            nets = [(c["name"], ipaddress.IPv4Network(c["subnet"], strict=False)) for c in cts]
+            for i, (an, a_) in enumerate(nets):
+                for bn, b_ in nets[i + 1:]:
+                    assert not a_.overlaps(b_), f"client tunnels {an} and {bn} have overlapping subnets ({a_}, {b_})"
+        else:
+            clash = [f for f in cfg.get("forwards", []) if (f["proto"], f["port"]) in listen_ports]
+            assert not clash, f"forward {list_str(clash)} collides with the transport tunnel's listening port"
+        for key, kind in (("services", "service"), ("forwards", "forward"), ("egress", "egress")):
+            for s in cfg.get(key, []):
+                parse_spec(spec_str(s), kind)
+    except (KeyError, AssertionError, ValueError, TypeError) as e:
+        die(f"{where}: invalid config ({e.__class__.__name__}: {e})")
+
+
+def save_config(cfg, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    cfg = dict(cfg, version=VERSION)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------- render
+
+def q(s):
+    return '"' + s + '"'
+
+
+def label(text):
+    return f"comment {q(text)}" if text else None
+
+
+def vpn_label(name):
+    """Tunnel name -> rule comment: river -> RIVER-VPN."""
+    return label(re.sub(r"(?i)-vpn$", "", name).upper() + "-VPN")
+
+
+def ports(d):
+    return f"{d['port']}-{d['port_end']}" if d.get("port_end") else str(d["port"])
+
+
+def ct_via(cfg, ct):
+    """Transport tunnels a client tunnel's clients come in through (every one if `via` isn't set)."""
+    names = ct.get("via")
+    return [r for r in cfg["transports"] if not names or r["name"] in names]
+
+
+def ifset(transports):
+    devs = [q(r["dev"]) for r in transports]
+    return devs[0] if len(devs) == 1 else "{ " + ", ".join(devs) + " }"
+
+
+def rule(*parts):
+    return "\t\t" + " ".join(p for p in parts if p)
+
+
+def wants_forwarding(cfg):
+    return cfg["role"] == "fe" or bool(cfg.get("join_nets"))
+
+
+def render(cfg):
+    """Ruleset in the house style: flush ruleset; inet filter with input, output, forward;
+    `counter` on accepts; `<NAME>-VPN` comments; final log rule. An FE gets a forward chain for its
+    port forwards; a gateway gets one only when join_nets is set (clients on those subnets reach each other)."""
+    role, wan, transports = cfg["role"], cfg["wan_if"], cfg["transports"]
+    r = transports[0]
+    pol = cfg["policy"]
+    log = cfg.get("log", True)
+    L = []
+    a = L.append
+
+    def chain(name):
+        a(f"\tchain {name} {{")
+        a(f"\t\ttype filter hook {name} priority filter; policy {pol};")
+
+    def log_rule(name):
+        if log:
+            a(rule(f"log prefix {q(f'nftables {name} dropped: ')}"))
+        a("\t}")
+
+    a("flush ruleset")
+    a("")
+    a("table inet filter {")
+
+    # ---- input
+    chain("input")
+    a("\t\tct state established,related accept")
+    a("\t\tct state invalid drop")
+    a('\t\tiif "lo" accept')
+    a("\t\tip protocol icmp accept")
+    for sv in cfg.get("services", []):
+        src = None
+        if sv.get("src"):
+            net = ipaddress.ip_network(sv["src"])
+            src = f"{'ip' if net.version == 4 else 'ip6'} saddr {net}"
+        a(rule(src, f"{sv['proto']} dport {ports(sv)} counter accept", label(sv.get("comment"))))
+    if cfg.get("dhcp"):
+        a(rule("udp sport 67 udp dport 68 counter accept"))
+    for x in transports:
+        if transport_listens(role, x):
+            src = f"ip saddr {x['peer_public_ip']}" if x.get("peer_public_ip") else None
+            a(rule(src, f"{x['proto']} dport {x['port']} counter accept", vpn_label(x["name"])))
+    if role == "gw":
+        for ct in cfg["client_tunnels"]:
+            via = f"iifname {ifset(ct_via(cfg, ct))}" if ct.get("only_via_transport", True) else None
+            a(rule(via, f"{ct['proto']} dport {ct['port']} counter accept", vpn_label(ct["name"])))
+    log_rule("input")
+    a("")
+
+    # ---- output
+    chain("output")
+    a("\t\tct state established,related accept")
+    a("\t\tct state invalid drop")
+    a('\t\toif "lo" accept')
+    a("\t\tip protocol icmp accept")
+    if cfg.get("dhcp"):
+        a(rule("udp sport 68 udp dport 67 counter accept"))
+    for proto in ("udp", "tcp"):
+        items = [ports(e) for e in cfg.get("egress", []) if e["proto"] == proto]
+        if items:
+            a(rule(f"{proto} dport {items[0] if len(items) == 1 else '{ ' + ', '.join(items) + ' }'} counter accept"))
+    for x in transports:
+        if transport_connects(role, x):
+            dst = f"ip daddr {x['peer_public_ip']}" if x.get("peer_public_ip") else None
+            a(rule(dst, f"{x['proto']} dport {x['port']} counter accept", vpn_label(x["name"])))
+    log_rule("output")
+
+    # ---- forward (FE: port forwards; gateway: only to join client subnets)
+    if role == "fe" or cfg.get("join_nets"):
+        a("")
+        chain("forward")
+        a("\t\tct state established,related accept")
+        a("\t\tct state invalid drop")
+        if role == "fe":
+            for f in cfg.get("forwards", []):
+                a(rule(f"{f['proto']} dport {f['to_port']} iifname {q(wan)} oifname {q(r['dev'])} counter accept"))
+        else:
+            nets = cfg["join_nets"]
+            ns = nets[0] if len(nets) == 1 else "{ " + ", ".join(nets) + " }"
+            a("\t\tip protocol icmp accept")
+            a(rule(f"ip saddr {ns} ip daddr {ns} counter accept"))
+        log_rule("forward")
+    a("}")
+
+    # ---- nat
+    if role == "fe" and cfg.get("forwards"):
+        a("table ip nat {")
+        a("\tchain prerouting {")
+        a("\t\ttype nat hook prerouting priority dstnat; policy accept;")
+        for f in cfg["forwards"]:
+            to = r["peer_ip"] + (f":{f['to_port']}" if f["to_port"] != f["port"] else "")
+            a(rule(f"iifname {q(wan)} {f['proto']} dport {f['port']} counter dnat to {to}"))
+        a("\t}")
+        a("")
+        a("\tchain postrouting {")
+        a("\t\ttype nat hook postrouting priority srcnat; policy accept;")
+        for f in cfg["forwards"]:
+            a(rule(f"oifname {q(r['dev'])} {f['proto']} dport {f['to_port']} counter snat to {r['local_ip']}"))
+        a("\t}")
+        a("}")
+    a("")
+    return "\n".join(L)
+
+def strip_header(text):
+    return "\n".join(l for l in text.splitlines() if not l.startswith("# Generated by tunnel-fw"))
+
+
+# --------------------------------------------------------------------------- wizard
+
+FLAG_NAMES = {"peer_public_ip": "fe-ip"}
+
+
+def new_taken(transports=()):
+    t = {"name": set(), "dev": set(), "local_ip": set(), "peer_ip": set()}
+    for r in transports:
+        for k in t:
+            t[k].add(r[k])
+    return t
+
+
+def ask_transport(role, d, taken, idx, prev=None, preset=None):
+    """Ask for one transport tunnel. d = defaults (existing transport tunnel or detected tunnel); taken = values other
+    transport tunnels already use; preset = values given as command-line flags (not prompted)."""
+    preset, prev, gw, other = preset or {}, prev or {}, role == "gw", other_role(role)
+
+    def uniq(key, validate, also=None):
+        def v(a):
+            val = validate(a)
+            if val in taken[key]:
+                raise ValueError(f"{val} is already used by another transport tunnel - each FE needs its own {key}")
+            if also and val == also():
+                raise ValueError("local and peer IP can't be the same")
+            return val
+        return v
+
+    def get(key, prompt, default, validate):
+        if preset.get(key) is not None:
+            try:
+                val = validate(str(preset[key]))
+            except ValueError as e:
+                die(f"--{FLAG_NAMES.get(key, key.replace('_', '-'))}: {e}")
+            print(f"  {prompt}: {preset[key]} (from flag)")
+            return val
+        return ask(prompt, default, validate)
+
+    # No suggested defaults: these must be typed (detected tunnels are listed at the top of setup).
+    name = get("name", "Transport tunnel name", None, uniq("name", v_name))
+    rtype = get("type", "Transport tunnel type (wireguard/openvpn)", None, v_type)
+    dev = get("dev", "Transport tunnel interface on this host", None, uniq("dev", v_iface))
+    spec = get("port", "Port", None, v_tunnel_port(rtype))
+    listener = get("listener", "Which side listens for the transport tunnel: fe, gw, or both", None, v_listener)
+    local_ip = get("local_ip", "This end's transport tunnel IP", None, uniq("local_ip", v_ip4))
+    peer_ip = get("peer_ip", f"The {other.upper()}'s transport tunnel IP", None,
+                  uniq("peer_ip", v_ip4, lambda: local_ip))
+    r = {"name": name, "type": rtype, "dev": dev, "proto": spec["proto"], "port": spec["port"],
+         "listener": listener, "local_ip": local_ip, "peer_ip": peer_ip}
+    pub = None  # only the gateway asks for the other end's (the FE's) public IP
+    if gw and listener in (other, "both"):
+        pub = get("peer_public_ip", f"The {other.upper()}'s public IP (this side connects to it)", None, v_ip4)
+    elif gw:
+        pub = get("peer_public_ip", f"The {other.upper()}'s public IP, to accept the transport tunnel only "
+                  "from it ('any' = anyone)", None, v_ip4_or_any)
+    if pub:
+        r["peer_public_ip"] = pub
+    for k in taken:
+        taken[k].add(r[k])
+    return r
+
+
+def new_ct_taken(cfg_like):
+    """Names/interfaces/ports/subnets already used on this gateway, so a new client tunnel can't clash."""
+    t = {"name": set(), "dev": set(), "port": set(), "subnet": []}
+    for r in cfg_like.get("transports", []):
+        t["dev"].add(r["dev"])
+        if transport_listens("gw", r):
+            t["port"].add((r["proto"], r["port"]))
+    for c in cfg_like.get("client_tunnels", []):
+        t["name"].add(c["name"])
+        t["dev"].add(c["dev"])
+        t["port"].add((c["proto"], c["port"]))
+        t["subnet"].append(c["subnet"])
+    return t
+
+
+def v_via(transports):
+    names = [r["name"] for r in transports]
+
+    def v(a):
+        if a.strip().lower() == "all":
+            return list(names)
+        got = []
+        for x in [x.strip() for x in a.replace(" ", ",").split(",") if x.strip()]:
+            if x not in names:
+                raise ValueError(f"{x}: no such transport tunnel (have: {', '.join(names)})")
+            if x not in got:
+                got.append(x)
+        if not got:
+            raise ValueError("name at least one transport tunnel")
+        return got
+    return v
+
+
+def ask_client_tunnel(d, transports, taken, preset=None, via=None):
+    """Ask for one client tunnel. d = defaults for the non-detail questions; taken = see new_ct_taken;
+    preset = values from command-line flags; via = fixed list of transport tunnel names (not asked)."""
+    preset = preset or {}
+
+    def uniq(key, validate):
+        def v(a):
+            val = validate(a)
+            if key == "port":
+                if (val["proto"], val["port"]) in taken["port"]:
+                    raise ValueError(f"{val['proto']}/{val['port']} is already used by another tunnel on this gateway")
+            elif key == "subnet":
+                net = ipaddress.IPv4Network(val)
+                for o in taken["subnet"]:
+                    if net.overlaps(ipaddress.IPv4Network(o)):
+                        raise ValueError(f"overlaps {o}, which another client tunnel uses")
+            elif val in taken[key]:
+                raise ValueError(f"{val} is already used by another tunnel on this gateway")
+            return val
+        return v
+
+    def get(key, prompt, validate):
+        if preset.get(key) is not None:
+            try:
+                val = validate(str(preset[key]))
+            except ValueError as e:
+                die(f"--client-{key}: {e}")
+            print(f"  {prompt}: {preset[key]} (from flag)")
+            return val
+        return ask(prompt, None, validate)
+
+    cname = get("name", "Client tunnel name", uniq("name", v_name))
+    stype = get("type", "Client tunnel type (wireguard/openvpn)", v_type)
+    dev = get("dev", "Client tunnel interface", uniq("dev", v_iface))
+    spec = get("port", "Client tunnel protocol/port", uniq("port", v_tunnel_port(stype)))
+    subnet = get("subnet", "Client subnet", uniq("subnet", v_net4))
+    s = {"name": cname, "type": stype, "dev": dev, "proto": spec["proto"], "port": spec["port"], "subnet": subnet}
+    if stype == "openvpn":
+        st = ask("OpenVPN status file, so doctor can list clients ('none' to skip)",
+                 d.get("status_file") or "none")
+        if st.lower() != "none":
+            s["status_file"] = st
+    s["only_via_transport"] = ask_yn("Accept clients ONLY through the transport tunnel(s) (hides gateway from direct access)",
+                                     d.get("only_via_transport", True))
+    if via is not None:
+        s["via"] = via
+    elif len(transports) == 1:
+        s["via"] = [transports[0]["name"]]
+    else:
+        s["via"] = ask(f"Transport tunnel(s) its clients come in through ({', '.join(r['name'] for r in transports)}; "
+                       "comma-separated, or 'all')", None, v_via(transports))
+    taken["name"].add(s["name"])
+    taken["dev"].add(s["dev"])
+    taken["port"].add((s["proto"], s["port"]))
+    taken["subnet"].append(s["subnet"])
+    return s
+
+
+def wizard(existing, det):
+    e = existing or {}
+    tunnels = det["tunnels"]
+
+    head("Detected on this host")
+    info(f"default-route interface: {det['wan_if'] or '?'}")
+    for t in tunnels:
+        info("tunnel: " + tunnel_str(t))
+    if not tunnels:
+        info("tunnels: none found (no OpenVPN or WireGuard configs) - you'll enter details by hand")
+    if det["listening"]:
+        info("listening: " + ", ".join(f"{p}/{n} ({proc})" for (p, n), proc in sorted(det["listening"].items())))
+    if det["current_open"]:
+        info("currently allowed by nftables: " + list_str(det["current_open"]))
+    if existing:
+        info("existing config found - its values are the defaults below")
+
+    head("Role")
+    print("    FE (Ingress): Receives client connections and forwards their VPN traffic through the transport tunnel.")
+    print("    GW (Gateway): Terminates transport tunnels and hosts the client VPN endpoint.")
+    role_default = e.get("role") or ("gw" if len(tunnels) >= 2 or any(t.get("multi") for t in tunnels) else "fe")
+    role = ask_choice("Role of this server", ["fe", "gw"], role_default)
+
+    head("Interfaces")
+    wan = ask("Public (internet-facing) interface", None, v_iface)
+    dhcp_default = e["dhcp"] if "dhcp" in e else det.get("dhcp", False)
+    print(f"    DHCP {'detected' if det.get('dhcp') else 'not detected'} on this server (static addresses need no DHCP rules)")
+    dhcp = ask_yn("Does this server get its IP address by DHCP (adds DHCP rules)", dhcp_default)
+
+    cfg = {"role": role, "wan_if": wan, "dhcp": dhcp}
+    reserved = set()
+    taken = new_taken()
+
+    if role == "fe":
+        head("Transport tunnel")
+        er = e["transports"][0] if e.get("role") == "fe" else {}
+        guess = next((t for t in tunnels if not t.get("multi")), tunnels[0] if tunnels else None)
+        d = {**(transport_view(guess, "fe") if guess else {}), **er}
+        transport = ask_transport("fe", d, taken, 0)
+        cfg["transports"] = [transport]
+        if transport_listens("fe", transport):
+            reserved.add((transport["proto"], transport["port"]))
+        head("Forwards (client tunnel port forward to gateway)")
+        print("    the clients' tunnel port(s), e.g. udp/11223 (WireGuard) or tcp/1194 (OpenVPN)")
+        print("    format: proto/port, or udp/51820:11223 to remap; comma-separated")
+        while True:
+            fw = ask("Ports to forward", None, v_forwards)
+            clash = [f for f in fw if (f["proto"], f["port"]) in reserved]
+            if not clash:
+                break
+            warn(f"{list_str(clash)} is the transport tunnel's own listening port")
+            if _EOF:
+                die("conflicting forwards with stdin closed")
+        cfg["forwards"] = fw
+        reserved |= {(f["proto"], f["port"]) for f in fw}
+    else:
+        ects = (e.get("client_tunnels") or []) if e.get("role") == "gw" else []
+        ct_devs = {c["dev"] for c in ects} | {t.get("dev") for t in tunnels if t.get("multi")}
+        taken["dev"] |= {c["dev"] for c in ects}
+
+        head("Transport tunnels")
+        ers = (e.get("transports") or []) if e.get("role") == "gw" else []
+        known = {x["dev"] for x in ers} | ct_devs
+        cands = list(ers) + [transport_view(t, "gw") for t in tunnels if t.get("dev") not in known]
+        if cands:
+            info(f"{len(cands)} candidate transport tunnel(s): " + ", ".join(x.get("name") or x.get("dev", "?") for x in cands))
+        transports = []
+        while True:
+            i = len(transports)
+            print(color("1", f"\n  -- FE #{i + 1}"))
+            transports.append(ask_transport("gw", cands[i] if i < len(cands) else {}, taken, i,
+                                    prev=transports[-1] if transports else None))
+            if not ask_yn("Add another FE", len(transports) < len(cands)):
+                break
+        cfg["transports"] = transports
+        reserved |= {(x["proto"], x["port"]) for x in transports if transport_listens("gw", x)}
+
+        head("Client tunnels")
+        print("    one per client network terminating here, e.g. one per FE leg")
+        ct_cands = list(ects) + [client_tunnel_view(t) for t in tunnels
+                                 if t.get("multi") and t.get("dev") not in {c["dev"] for c in ects}]
+        ctaken = new_ct_taken({"transports": transports})
+        cts = []
+        while True:
+            i = len(cts)
+            print(color("1", f"\n  -- client tunnel #{i + 1}"))
+            cts.append(ask_client_tunnel(ct_cands[i] if i < len(ct_cands) else {}, transports, ctaken))
+            if not ask_yn("Add another client tunnel", len(cts) < max(len(ct_cands), 1)):
+                break
+        cfg["client_tunnels"] = cts
+        reserved |= {(c["proto"], c["port"]) for c in cts}
+
+    head("Services to keep open on this server")
+    print("    format: tcp/22, tcp/8000-8100, tcp/22@203.0.113.0/24 (source-restricted)")
+    print("    tunnel ports are handled automatically - don't list them")
+    if existing and e.get("services") is not None:
+        sdef = list_str([x for x in e["services"] if (x["proto"], x["port"]) not in reserved])
+    else:
+        cand = [x for x in det["current_open"] if (x["proto"], x["port"]) not in reserved]
+        for (p, n), proc in det["listening"].items():
+            if proc.startswith("sshd") and (p, n) not in reserved:
+                cand.append({"proto": p, "port": n})
+        for n in det["ssh_ports"]:
+            cand.append({"proto": "tcp", "port": n})
+        sdef = list_str(merge_services(cand)) if cand else "tcp/22"
+    while True:
+        services = merge_services(ask("Open ports", sdef, parse_list))
+        clash = [x for x in services if (x["proto"], x["port"]) in reserved]
+        if not clash:
+            break
+        warn(f"{list_str(clash)} already handled by the tunnel rules - remove them")
+        if _EOF:
+            die("conflicting services with stdin closed")
+    for sp in sorted(det["ssh_ports"]):
+        covered = any(x["proto"] == "tcp" and not x.get("src") and x["port"] <= sp <= x.get("port_end", x["port"])
+                      for x in services)
+        if not covered:
+            warn(f"your current SSH session uses tcp/{sp}, which is not in that list - you would be locked out")
+            if ask_yn(f"Add tcp/{sp}", True):
+                services.append({"proto": "tcp", "port": sp})
+    for x in services:     # unlabelled SSH ports get the usual labels
+        if x["proto"] == "tcp" and not x.get("port_end") and not x.get("comment"):
+            if x["port"] == 22:
+                x["comment"] = "SSH"
+            elif x["port"] in det["ssh_ports"]:
+                x["comment"] = "CUSTOM-SSH-PORT"
+    cfg["services"] = services
+
+    head("Outbound")
+    print("    allowed outbound ports; the tunnels' own traffic is added automatically")
+    edef = list_str(e["egress"]) if e.get("egress") else DEFAULT_EGRESS
+    cfg["egress"] = ask("Allowed outbound", edef, lambda a: parse_list(a, "egress"))
+
+    head("Policy")
+    print("    accept = unlisted traffic is logged but let through (log only)")
+    print("    drop   = unlisted traffic is blocked")
+    cfg["policy"] = ask_choice("Policy for unlisted traffic", ["accept", "drop"], None)
+    cfg["log"] = ask_yn("Log unlisted traffic", e.get("log", True))
+    validate_config(cfg, "wizard")
+    return cfg
+
+
+def transport_line(role, r):
+    other = other_role(role)
+    who = {"both": "both listen", role: "this side listens", other: f"{other} listens"}[r["listener"]]
+    pub = r.get("peer_public_ip")
+    return (f"transport tunnel {r['name']}: {r['type']} {r['dev']} {r['proto']}/{r['port']} ({who})  "
+            f"{r['local_ip']} <-> {r['peer_ip']}"
+            + ("" if role == "fe" else f"  {other.upper()}={pub}" if pub else f"  {other.upper()}=any"))
+
+
+def summarize(cfg):
+    head("Summary")
+    info(f"role {cfg['role']}, public iface {cfg['wan_if']}")
+    for r in cfg["transports"]:
+        info(transport_line(cfg["role"], r))
+    if cfg["role"] == "fe":
+        info(f"forward to gateway: {list_str(cfg.get('forwards', []))}")
+    else:
+        for s in cfg["client_tunnels"]:
+            via = ", ".join(r["name"] for r in ct_via(cfg, s)) if s.get("only_via_transport", True) else "anywhere"
+            info(f"client tunnel {s['name']}: {s['type']} {s['dev']} {s['proto']}/{s['port']} {s['subnet']}  "
+                 f"clients via {via}")
+        info(f"joined client subnets: {', '.join(cfg['join_nets']) if cfg.get('join_nets') else 'none'}")
+    info(f"open services: {list_str(cfg['services'])}")
+    info(f"outbound allowed: {list_str(cfg['egress'])} (+tunnels)")
+    info(f"policy: {cfg['policy']}" + (" (log only - nothing is blocked)" if cfg["policy"] == "accept" else "")
+         + f"; logging {'on' if cfg.get('log', True) else 'off'}")
+    info(f"DHCP rules: {'yes' if cfg.get('dhcp') else 'no'}")
+    info(f"ip_forward: {'on' if wants_forwarding(cfg) else 'unchanged'}")
+
+
+# --------------------------------------------------------------------------- apply
+
+def show_diff(old, new):
+    lines = list(difflib.unified_diff(strip_header(old).splitlines(), strip_header(new).splitlines(),
+                                      NFT_CONF + " (current)", NFT_CONF + " (new)", lineterm="", n=2))
+    if not lines:
+        ok(f"{NFT_CONF} already matches")
+        return False
+    for l in lines:
+        print("    " + (color("32", l) if l.startswith("+") else color("31", l) if l.startswith("-")
+                        else color("36", l) if l.startswith("@@") else l))
+    return True
+
+
+def nft_check(path):
+    rc, _, err = run(["nft", "-c", "-f", path])
+    return rc == 0, err.strip()
+
+
+def read_forward():
+    try:
+        return open("/proc/sys/net/ipv4/ip_forward").read().strip()
+    except OSError:
+        return None
+
+
+def foreign_tables():
+    rc, out, _ = run(["nft", "list", "tables"])
+    ours = {"inet filter", "ip nat"}
+    return [l.replace("table ", "", 1).strip() for l in out.splitlines()
+            if l.startswith("table ") and l.replace("table ", "", 1).strip() not in ours]
+
+
+def confirm_or_rollback(backup, timeout, old_fwd):
+    restore = f"nft -f '{backup}'"
+    if old_fwd is not None:
+        restore += f"; sysctl -qw net.ipv4.ip_forward={old_fwd}"
+    guard = subprocess.Popen(
+        ["/bin/sh", "-c", f"sleep {timeout + 5}; {restore}; logger -t tunnel-fw 'not confirmed: rolled back to {backup}'"],
+        start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def kill_guard():
+        try:
+            os.killpg(guard.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    print()
+    print(color("1;33", "  Rules are LIVE. Open a NEW ssh session now and confirm you can still get in."))
+    print(color("1;33", f"  Type 'yes' within {timeout}s to keep them; anything else (or silence / a dropped"))
+    print(color("1;33", "  connection) rolls back automatically."))
+    sys.stdout.write("  keep? ")
+    sys.stdout.flush()
+    answer = None
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        if ready:
+            answer = sys.stdin.readline().strip().lower()
+    except (OSError, ValueError):
+        pass
+    kill_guard()
+    if answer == "yes":
+        ok("confirmed")
+        return True
+    print()
+    run(["nft", "-f", backup])
+    if old_fwd is not None:
+        run(["sysctl", "-qw", f"net.ipv4.ip_forward={old_fwd}"])
+    bad(f"not confirmed - rolled back to previous ruleset ({backup})")
+    return False
+
+
+def ensure_conntrack(interactive):
+    if shutil.which("conntrack"):
+        return True
+    if interactive and ask_yn("The 'conntrack' tool is missing (needed to clear stale NAT state). Install it", True):
+        rc, _, err = run(["apt-get", "install", "-y", "conntrack"])
+        if rc == 0:
+            ok("installed conntrack")
+            return True
+        warn(f"apt-get failed: {err.strip()[-200:]}")
+    return False
+
+
+def flush_forward_conntrack(cfg, interactive):
+    """Flows that started before the DNAT rules existed stay un-NATed forever while the client keeps
+    retrying from the same source port (UDP timeout refreshes). Clear them so the next packet is NATed."""
+    if cfg["role"] != "fe" or not cfg.get("forwards"):
+        return
+    if not ensure_conntrack(interactive):
+        warn("skipped conntrack flush; if clients can't connect run: "
+             + "; ".join(f"conntrack -D -p {f['proto']} --dport {f['port']}" for f in cfg["forwards"]))
+        return
+    for f in cfg["forwards"]:
+        rc, out, err = run(["conntrack", "-D", "-p", f["proto"], "--dport", str(f["port"])])
+        m = re.search(r"(\d+) flow entries", out + err)
+        ok(f"cleared {m.group(1) if m else 0} conntrack entries for {f['proto']}/{f['port']} "
+           "(clients reconnect automatically)")
+
+
+def write_atomic(path, text, mode):
+    tmp = path + ".tunnel-fw.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def persist_ip_forward():
+    """Make ip_forward=1 survive reboots by editing the system's own sysctl.conf (no extra file).
+    An active `net.ipv4.ip_forward=0` is switched to 1; else a commented-out line is uncommented; else one is appended."""
+    path = os.path.realpath(SYSCTL_CONF if os.path.exists(SYSCTL_CONF) else "/etc/sysctl.conf")
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+        mode = os.stat(path).st_mode & 0o7777
+    except FileNotFoundError:
+        lines, mode = [], 0o644
+    active = re.compile(r"^\s*net\.ipv4\.ip_forward\s*=\s*(\S+)")
+    commented = re.compile(r"^\s*#\s*net\.ipv4\.ip_forward\s*=")
+    vals = [m.group(1) for m in map(active.match, lines) if m]
+    if vals and all(v == "1" for v in vals):
+        return None
+    if vals:
+        lines = ["net.ipv4.ip_forward=1" if active.match(l) else l for l in lines]
+    else:
+        i = next((i for i, l in enumerate(lines) if commented.match(l)), None)
+        if i is None:
+            lines.append("net.ipv4.ip_forward=1")
+        else:
+            lines[i] = "net.ipv4.ip_forward=1"
+    write_atomic(path, "\n".join(lines) + "\n", mode)
+    return path
+
+
+def apply(cfg, assume_yes=False, no_rollback=False, timeout=60, interactive=True):
+    need_root("applying rules")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    text = render(cfg)
+    cand = os.path.join(STATE_DIR, "candidate.nft")
+    write_atomic(cand, text, 0o600)
+
+    head("Validating")
+    good, err = nft_check(cand)
+    if not good:
+        die(f"nft rejected the generated ruleset (nothing changed):\n{err}")
+    ok("nft syntax check passed")
+    ft = foreign_tables()
+    if ft:
+        warn(f"these live tables are not managed by tunnel-fw and will be REMOVED: {', '.join(ft)}")
+        if shutil.which("docker"):
+            warn("docker is installed - its NAT rules will be wiped until docker restarts")
+    rc, out, _ = run(["ufw", "status"])
+    if "Status: active" in out:
+        warn("ufw is active and will fight these rules; consider `ufw disable`")
+
+    head("Changes")
+    try:
+        old = open(NFT_CONF).read()
+    except OSError:
+        old = ""
+    show_diff(old, text)
+    if not assume_yes and not ask_yn("Apply now", True):
+        info(f"not applied; candidate left at {cand}")
+        return False
+
+    head("Applying")
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = os.path.join(STATE_DIR, f"backup-{ts}.nft")
+    rc, live, _ = run(["nft", "list", "ruleset"])
+    write_atomic(backup, "flush ruleset\n" + live, 0o600)
+    rollback_ok, berr = nft_check(backup)
+    if os.path.exists(NFT_CONF):
+        shutil.copy2(NFT_CONF, os.path.join(STATE_DIR, f"nftables.conf-{ts}"))
+    if not rollback_ok:
+        warn(f"the current live ruleset can't be re-loaded as a backup ({berr.splitlines()[0] if berr else '?'}); "
+             "automatic rollback is unavailable")
+        if not no_rollback and not assume_yes and not ask_yn("Continue without rollback protection", False):
+            return False
+
+    old_fwd = read_forward()
+    if wants_forwarding(cfg) and old_fwd != "1":
+        run(["sysctl", "-qw", "net.ipv4.ip_forward=1"])
+        ok("enabled net.ipv4.ip_forward")
+
+    rc, _, err = run(["nft", "-f", cand])
+    if rc != 0:
+        if old_fwd is not None:
+            run(["sysctl", "-qw", f"net.ipv4.ip_forward={old_fwd}"])
+        die(f"nft -f failed (live rules unchanged):\n{err}")
+    ok("ruleset loaded")
+
+    guard = rollback_ok and not no_rollback and sys.stdin.isatty()
+    if rollback_ok and not no_rollback and not sys.stdin.isatty():
+        warn("no terminal for confirmation - rollback guard skipped")
+    if guard and not confirm_or_rollback(backup, timeout, old_fwd):
+        return False
+
+    write_atomic(NFT_CONF, text, 0o755)
+    ok(f"wrote {NFT_CONF}")
+    if wants_forwarding(cfg):
+        changed = persist_ip_forward()
+        ok(f"set net.ipv4.ip_forward=1 in {changed}" if changed else f"net.ipv4.ip_forward=1 already set in {SYSCTL_CONF}")
+    if os.path.exists(LEGACY_SYSCTL_FILE):
+        os.remove(LEGACY_SYSCTL_FILE)
+        ok(f"removed {LEGACY_SYSCTL_FILE} (no longer used)")
+    rc, _, err = run(["systemctl", "enable", "nftables"])
+    if rc == 0:
+        ok("nftables.service enabled (rules load at boot, before networking)")
+    else:
+        warn(f"couldn't enable nftables.service: {err.strip()}")
+
+    flush_forward_conntrack(cfg, interactive and not assume_yes)
+
+    backups = sorted(glob.glob(os.path.join(STATE_DIR, "backup-*.nft")))
+    for b in backups[:-KEEP_BACKUPS]:
+        os.remove(b)
+    head("Done")
+    info("run `tunnel-fw doctor` to check the whole path")
+    return True
+
+
+# --------------------------------------------------------------------------- live state
+
+def wg_peers(dev):
+    rc, out, _ = run(["wg", "show", dev, "dump"])
+    peers, now = [], time.time()
+    for p in [l.split("\t") for l in out.strip().splitlines()[1:]] if rc == 0 else []:
+        if len(p) < 5:
+            continue
+        hs = int(p[4]) if p[4].isdigit() else 0
+        host = p[2].rsplit(":", 1)[0].strip("[]") if p[2] != "(none)" else None
+        peers.append({"label": p[3], "endpoint": p[2], "host": host, "age": int(now - hs) if hs else None})
+    return peers
+
+
+def openvpn_clients(path):
+    """Parse an OpenVPN status file (v1, v2 or v3). None if unreadable."""
+    try:
+        text = open(path, errors="replace").read()
+    except OSError:
+        return None
+    out, in_v1 = [], False
+    for line in text.splitlines():
+        f = re.split(r"[,\t]", line)
+        if f[0] == "CLIENT_LIST" and len(f) > 2:
+            name, real = f[1], f[2]
+        elif line.startswith("Common Name,Real Address"):
+            in_v1 = True
+            continue
+        elif line.startswith("ROUTING TABLE"):
+            in_v1 = False
+            continue
+        elif in_v1 and len(f) >= 2:
+            name, real = f[0], f[1]
+        else:
+            continue
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)", real)
+        out.append({"label": name, "endpoint": real, "host": m.group(1) if m else None, "age": 0})
+    return out
+
+
+def client_list(s):
+    """-> list of {label, endpoint, host, age} (age None = never, 0 = connected now), or None if unknown."""
+    if s["type"] == "wireguard":
+        return wg_peers(s["dev"])
+    return openvpn_clients(s["status_file"]) if s.get("status_file") else None
+
+
+def port_listening(proto, port):
+    rc, out, _ = run(["ss", "-Hln" + ("u" if proto == "udp" else "t")])
+    return any(re.search(rf":{port}\s", l) for l in out.splitlines())
+
+
+# --------------------------------------------------------------------------- doctor
+
+def doctor(cfg, fix=False, config_path=CONFIG_PATH):
+    need_root("doctor")
+    problems = 0
+
+    def chk(cond, good, badmsg):
+        nonlocal problems
+        if cond:
+            ok(good)
+        else:
+            bad(badmsg)
+            problems += 1
+        return cond
+
+    role, transports = cfg["role"], cfg["transports"]
+    head(f"tunnel-fw doctor (role {role})")
+    rc, out, _ = run(["systemctl", "is-enabled", "nftables"])
+    chk(out.strip() == "enabled", "nftables.service enabled at boot",
+        "nftables.service NOT enabled - rules vanish on reboot (run `tunnel-fw apply`)")
+    try:
+        disk = open(NFT_CONF).read()
+    except OSError:
+        disk = ""
+    chk(strip_header(disk) == strip_header(render(cfg)), f"{NFT_CONF} matches config",
+        f"{NFT_CONF} differs from {config_path} - run `tunnel-fw apply`")
+    rc, out, _ = run(["nft", "list", "tables"])
+    need = {"table inet filter"} | ({"table ip nat"} if role == "fe" and cfg.get("forwards") else set())
+    chk(need <= set(l.strip() for l in out.splitlines()), "live ruleset has the expected tables",
+        "live ruleset is missing tunnel-fw tables - run `tunnel-fw apply`")
+    if wants_forwarding(cfg):
+        chk(read_forward() == "1", "net.ipv4.ip_forward = 1", "net.ipv4.ip_forward is 0 - forwarding is off")
+
+    for r in transports:
+        head(f"Transport tunnel {r['name']} ({r['type']} {r['dev']})")
+        svc = "wg-quick@" + r["dev"] if r["type"] == "wireguard" else "openvpn@<name>"
+        if not chk(os.path.exists(f"/sys/class/net/{r['dev']}"), f"interface {r['dev']} exists",
+                   f"interface {r['dev']} missing - is its tunnel running? (systemctl status {svc})"):
+            continue
+        local, _, _ = iface_v4(r["dev"])
+        chk(local == r["local_ip"], f"{r['dev']} has {r['local_ip']}", f"{r['dev']} has {local}, config says {r['local_ip']}")
+        if transport_listens(role, r):
+            chk(port_listening(r["proto"], r["port"]), f"listening on {r['proto']}/{r['port']}",
+                f"nothing listening on {r['proto']}/{r['port']}")
+        if r["type"] == "wireguard":
+            ages = [p["age"] for p in wg_peers(r["dev"]) if p["age"] is not None]
+            if ages:
+                (ok if min(ages) < 180 else warn)(f"WireGuard handshake {min(ages)}s ago")
+            else:
+                warn("WireGuard: no handshake yet")
+        rc, out, _ = run(["ping", "-c", "2", "-W", "2", "-I", r["dev"], r["peer_ip"]])
+        m = re.search(r"= [\d.]+/([\d.]+)/", out)
+        chk(rc == 0, f"peer {r['peer_ip']} answers ({m.group(1) if m else '?'} ms)",
+            f"peer {r['peer_ip']} does not answer over the transport tunnel")
+
+    if role == "fe":
+        r = transports[0]
+        head("Forwards")
+        rc, natout, _ = run(["nft", "list", "chain", "ip", "nat", "prerouting"])
+        ct = ensure_conntrack(False)
+        if not ct:
+            warn("conntrack tool not installed - can't inspect NAT state (apt install conntrack)")
+        for f in cfg.get("forwards", []):
+            m = re.search(rf"{f['proto']} dport {f['port']} counter packets (\d+)", natout)
+            hits = "no counter" if not m else f"{m.group(1)} pkts DNATed"
+            info(f"{spec_str(f)} -> {r['peer_ip']}:{f['to_port']} ({hits})")
+            if not ct:
+                continue
+            rc, out, err = run(["conntrack", "-L", "-p", f["proto"], "--dport", str(f["port"])])
+            good_n, stale = 0, []
+            for line in out.splitlines():
+                srcs = re.findall(r"src=(\S+)", line)
+                dsts = re.findall(r"dst=(\S+)", line)
+                sps = re.findall(r"sport=(\d+)", line)
+                if len(srcs) < 2 or not dsts or dsts[0] == r["peer_ip"]:
+                    continue
+                if srcs[1] == r["peer_ip"]:
+                    good_n += 1
+                else:
+                    stale.append((srcs[0], sps[0] if sps else None))
+            if good_n:
+                ok(f"{good_n} client flow(s) correctly NATed into the transport tunnel")
+            else:
+                info("no active client flows right now")
+            if stale:
+                bad(f"{len(stale)} STALE flow(s) not NATed (created before the rules loaded): "
+                    + ", ".join(f"{s}:{p}" for s, p in stale) + " - these clients can't connect")
+                problems += 1
+                if fix:
+                    for s, p in stale:
+                        cmd = ["conntrack", "-D", "-p", f["proto"], "-s", s, "--dport", str(f["port"])]
+                        if p:
+                            cmd += ["--sport", p]
+                        run(cmd)
+                    ok("deleted stale flows; clients will reconnect within seconds")
+                    problems -= 1
+                else:
+                    info("fix with: tunnel-fw doctor --fix")
+    else:
+        via = {x["peer_ip"]: x["name"] for x in transports}
+        for s in cfg["client_tunnels"]:
+            allowed = {r["name"] for r in ct_via(cfg, s)}
+            head(f"Client tunnel {s['name']} ({s['type']} {s['dev']})")
+            if chk(os.path.exists(f"/sys/class/net/{s['dev']}"), f"{s['dev']} is up",
+                   f"{s['dev']} is down - is the client tunnel service running?"):
+                chk(port_listening(s["proto"], s["port"]), f"listening on {s['proto']}/{s['port']}",
+                    f"nothing listening on {s['proto']}/{s['port']}")
+                clients = client_list(s)
+                if clients is None:
+                    info("can't list OpenVPN clients - set a status file (`status /run/openvpn-<name>.status` in its "
+                         "config, then `tunnel-fw setup`)")
+                else:
+                    active = {x["name"]: 0 for x in transports if x["name"] in allowed}
+                    for c in clients:
+                        host, age = c["host"], c["age"]
+                        route = f"via {via[host]}" if host in via else ("direct" if host else "")
+                        desc = f"client {c['label']:<18} {route:<12} endpoint {c['endpoint']:<22}"
+                        if age is None:
+                            info(desc + " never connected")
+                        elif age < 180:
+                            ok(desc + (" connected" if age == 0 and s["type"] == "openvpn" else f" handshake {age}s ago"))
+                            if host in via:
+                                active[via[host]] = active.get(via[host], 0) + 1
+                        else:
+                            warn(desc + f" last handshake {age // 60} min ago")
+                        if s.get("only_via_transport", True) and host and host not in via:
+                            warn("  ^ reached the gateway without going through any configured transport tunnel")
+                        elif s.get("only_via_transport", True) and host in via and via[host] not in allowed:
+                            warn(f"  ^ came in through {via[host]}, which isn't listed for this client tunnel")
+                    info("active clients per transport tunnel: " + ", ".join(f"{n}={c}" for n, c in active.items()))
+
+    if role == "gw" and cfg.get("join_nets"):
+        head("Joined client subnets")
+        chk(read_forward() == "1", "net.ipv4.ip_forward = 1", "net.ipv4.ip_forward is 0 - joined subnets can't reach each other")
+        for n in cfg["join_nets"]:
+            net = ipaddress.IPv4Network(n)
+            host = str(next(net.hosts(), net.network_address))
+            rc, out, _ = run(["ip", "-o", "route", "get", host])
+            m = re.search(r"\bdev (\S+)", out)
+            dev = m.group(1) if m else None
+            chk(rc == 0 and dev and dev != cfg["wan_if"], f"{n} is reachable via {dev}",
+                f"{n} has no route through a client tunnel (goes via {dev or '?'}) - is that leg's tunnel up?")
+    head("Result")
+    if problems:
+        bad(f"{problems} problem(s) found")
+    else:
+        ok("all checks passed")
+    return problems == 0
+
+
+# --------------------------------------------------------------------------- multi-FE
+
+def require_gw(cfg, what):
+    if cfg["role"] != "gw":
+        die(f"{what} runs on the gateway." + (" On a new FE, run `tunnel-fw setup` there and choose role fe."
+                                              if what == "add-fe" else ""))
+
+
+def list_fe(cfg):
+    role, transports = cfg["role"], cfg["transports"]
+    head(f"Transport tunnels on this {'gateway' if role == 'gw' else 'FE'}")
+    active, counted = {}, False
+    if role == "gw" and os.geteuid() == 0:
+        via = {x["peer_ip"]: x["name"] for x in transports}
+        for ct in cfg["client_tunnels"]:
+            clients = client_list(ct)
+            if clients is None:
+                continue
+            counted = True
+            for c in clients:
+                if c["host"] in via and c["age"] is not None and c["age"] < 180:
+                    active[via[c["host"]]] = active.get(via[c["host"]], 0) + 1
+    for r in transports:
+        up = os.path.exists(f"/sys/class/net/{r['dev']}")
+        carries = ([c["name"] for c in cfg["client_tunnels"] if r in ct_via(cfg, c)] if role == "gw" else [])
+        line = (transport_line(role, r) + (f"  carries {', '.join(carries) or 'no client tunnel'}" if role == "gw" else "")
+                + (f"  clients {active.get(r['name'], 0)}" if counted else ""))
+        (ok if up else bad)(line + ("" if up else "  (interface down)"))
+
+
+def add_fe(cfg, args):
+    require_gw(cfg, "add-fe")
+    transports = cfg["transports"]
+    known = {r["dev"] for r in transports} | {c["dev"] for c in cfg["client_tunnels"]}
+    found = detect_tunnels()
+    cand = next((t for t in found if t.get("dev") not in known and not t.get("multi")), None)
+    head(f"Add an FE transport tunnel (this gateway has {len(transports)}: {', '.join(r['name'] for r in transports)})")
+    if cand:
+        info(f"found a tunnel not configured yet (for reference): {tunnel_str(cand)}")
+    else:
+        warn("no un-configured tunnel found here; set up the new FE's transport tunnel (OpenVPN or WireGuard, with its "
+             "own tunnel IPs) first, or enter the values by hand")
+    preset = {"name": args.name, "type": args.type, "dev": args.dev, "port": args.port,
+              "listener": args.listener, "local_ip": args.local_ip, "peer_ip": args.peer_ip,
+              "peer_public_ip": args.fe_ip}
+    r = ask_transport("gw", transport_view(cand, "gw") if cand else {}, new_taken(transports), len(transports),
+                  prev=transports[-1], preset=preset)
+    new = json.loads(json.dumps(cfg))
+    # a client tunnel without `via` means "every transport tunnel"; pin it to today's legs so the new FE
+    # doesn't silently start carrying it (we ask below instead)
+    for c in new["client_tunnels"]:
+        if c.get("only_via_transport", True) and not c.get("via"):
+            c["via"] = [t["name"] for t in transports]
+    new["transports"].append(r)
+
+    ct_preset = {"name": args.client_name, "type": args.client_type, "dev": args.client_dev,
+                 "port": args.client_port, "subnet": args.client_subnet}
+    explicit = [c for c in new["client_tunnels"] if c.get("only_via_transport", True) and c.get("via")]
+    if args.carries is not None:
+        want = v_via_names(args.carries, [c["name"] for c in new["client_tunnels"]], "--carries")
+        for c in new["client_tunnels"]:
+            if c["name"] in want and c.get("via") and r["name"] not in c["via"]:
+                c["via"].append(r["name"])
+    if any(v is not None for v in ct_preset.values()):
+        add_ct = True
+    elif args.no_client_tunnel:
+        add_ct = False
+    else:
+        add_ct = ask_yn(f"Add a client tunnel whose clients come in through {r['name']}", True)
+    if add_ct:
+        head(f"Client tunnel for {r['name']}")
+        ct_cand = next((t for t in found if t.get("multi") and t.get("dev") not in known), None)
+        if ct_cand:
+            info(f"found a client tunnel not configured yet (for reference): {tunnel_str(ct_cand)}")
+        new["client_tunnels"].append(ask_client_tunnel(client_tunnel_view(ct_cand) if ct_cand else {},
+                                                       new["transports"], new_ct_taken(new), ct_preset, via=[r["name"]]))
+    elif args.carries is None and not args.no_client_tunnel:
+        for c in explicit:
+            if ask_yn(f"Do {c['name']} clients also come in through {r['name']}", False):
+                nc = next(x for x in new["client_tunnels"] if x["name"] == c["name"])
+                nc["via"].append(r["name"])
+    if not any(r in ct_via(new, c) for c in new["client_tunnels"]):
+        warn(f"no client tunnel comes in through {r['name']} yet - its clients won't be accepted")
+    validate_config(new, "add-fe")
+    return new
+
+
+def v_via_names(a, names, flag):
+    got = [x.strip() for x in a.replace(" ", ",").split(",") if x.strip()]
+    bad_ = [x for x in got if x not in names]
+    if bad_:
+        die(f"{flag}: no client tunnel called {', '.join(bad_)} (have: {', '.join(names)})")
+    return got
+
+
+def remove_fe(cfg, which):
+    require_gw(cfg, "remove-fe")
+    match = [r for r in cfg["transports"] if which in (r["name"], r["dev"])]
+    if not match:
+        die(f"no transport tunnel called '{which}' (have: {', '.join(r['name'] for r in cfg['transports'])})")
+    if len(cfg["transports"]) == 1:
+        die("that's the only transport tunnel - clients would have no way in. Use `tunnel-fw setup` to replace it.")
+    gone = match[0]
+    affected = [c for c in cfg["client_tunnels"] if gone in ct_via(cfg, c)]
+    new = json.loads(json.dumps(cfg))
+    new["transports"] = [r for r in new["transports"] if r["name"] != gone["name"]]
+    dropped = []
+    for c in new["client_tunnels"]:
+        if c.get("via") and gone["name"] in c["via"]:
+            c["via"].remove(gone["name"])
+            if not c["via"]:
+                dropped.append(c["name"])
+    head(f"Remove FE transport tunnel {gone['name']} ({gone['type']} {gone['dev']})")
+    if dropped and len(dropped) == len(new["client_tunnels"]):
+        die(f"{', '.join(dropped)} only come(s) in through {gone['name']} - removing it would leave no client tunnel. "
+            "Use `tunnel-fw setup` to rebuild instead.")
+    new["client_tunnels"] = [c for c in new["client_tunnels"] if c["name"] not in dropped]
+    if dropped:
+        warn(f"client tunnel(s) {', '.join(dropped)} only came in through {gone['name']} and are removed too")
+    warn(f"clients currently coming in through {gone['name']} will be cut off")
+    return new, {"transport": gone, "client_tunnels": affected, "dropped": dropped}
+
+
+def join_nets(cfg, args):
+    """Gateway: let clients on the listed subnets (typically one per FE leg) reach each other."""
+    require_gw(cfg, "join-nets")
+    new = json.loads(json.dumps(cfg))
+    cur = cfg.get("join_nets") or []
+    head("Join client subnets")
+    info(f"currently joined: {', '.join(cur) if cur else 'none'}")
+    if args.off:
+        if not cur:
+            die("no client subnets are joined - nothing to turn off")
+        new.pop("join_nets", None)
+        warn("clients on different subnets will no longer reach each other")
+        return new
+    if args.nets:
+        try:
+            nets = v_join_nets(args.nets)
+        except ValueError as e:
+            die(str(e))
+    else:
+        mine = [c["subnet"] for c in cfg["client_tunnels"]]
+        print("    client subnets whose clients may talk to each other, e.g. one per FE leg,")
+        print("    or one network covering them all (172.23.0.0/16)")
+        info("client tunnel subnets here: " + ", ".join(f"{c['name']}={c['subnet']}" for c in cfg["client_tunnels"]))
+        nets = ask("Client subnets to join", ", ".join(cur or mine), v_join_nets)
+    new["join_nets"] = nets
+    return new
+
+
+def flush_removed_transport(removed, interactive):
+    """Established flows from the removed transport tunnel would otherwise stay accepted while clients keep sending."""
+    gone = removed["transport"]
+    have_ct = ensure_conntrack(interactive)
+    for s in removed["client_tunnels"]:
+        cmd = ["conntrack", "-D", "-p", s["proto"], "-s", gone["peer_ip"], "--dport", str(s["port"])]
+        if not have_ct:
+            warn(f"skipped; to cut existing {s['name']} clients now run: {' '.join(cmd)}")
+            continue
+        rc, out, err = run(cmd)
+        m = re.search(r"(\d+) flow entries", out + err)
+        ok(f"cleared {m.group(1) if m else 0} {s['name']} conntrack entries from {gone['name']}")
+    svc = f"wg-quick@{gone['dev']}" if gone["type"] == "wireguard" else "openvpn@<name>"
+    info(f"remember to stop that transport tunnel's tunnel on this host (e.g. systemctl disable --now {svc})")
+    for name in removed["dropped"]:
+        info(f"and the {name} client tunnel's service, which no longer has a way in")
+
+
+def dry_run_show(cfg):
+    head("Ruleset (dry run - nothing changed)")
+    text = render(cfg)
+    print(text)
+    if os.geteuid() == 0:
+        tmp = f"/tmp/tunnel-fw-dryrun-{os.getpid()}.nft"
+        write_atomic(tmp, text, 0o600)
+        good, err = nft_check(tmp)
+        os.remove(tmp)
+        if good:
+            ok("nft syntax check passed")
+        else:
+            bad(f"nft rejected it:\n{err}")
+
+
+# --------------------------------------------------------------------------- main
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="tunnel-fw", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", default=CONFIG_PATH, help=f"config file (default {CONFIG_PATH})")
+    ap.add_argument("--version", action="version", version=f"tunnel-fw {VERSION}")
+    sub = ap.add_subparsers(dest="cmd")
+    s = sub.add_parser("setup", help="interactive wizard, then apply (default)")
+    s.add_argument("--dry-run", action="store_true", help="ask questions and print the ruleset; change nothing")
+    ap_ = sub.add_parser("apply", help="apply the saved config")
+    af = sub.add_parser("add-fe", help="(gateway) add another FE transport tunnel")
+    af.add_argument("--dry-run", action="store_true", help="show the result; change nothing")
+    af.add_argument("--name", help="transport tunnel name, e.g. river2 (comment becomes RIVER2-VPN)")
+    af.add_argument("--type", help="transport tunnel type: wireguard or openvpn")
+    af.add_argument("--dev", help="transport tunnel interface on this gateway, e.g. fe2")
+    af.add_argument("--port", help="transport tunnel proto/port on the listening side, e.g. udp/43022")
+    af.add_argument("--listener", help="which side listens for the transport tunnel: fe, gw or both")
+    af.add_argument("--local-ip", help="this gateway's transport tunnel IP")
+    af.add_argument("--peer-ip", help="the FE's transport tunnel IP")
+    af.add_argument("--fe-ip", help="the FE's public IP")
+    af.add_argument("--client-name", help="new client tunnel coming in through this FE: name, e.g. salmon2")
+    af.add_argument("--client-type", help="new client tunnel: wireguard or openvpn")
+    af.add_argument("--client-dev", help="new client tunnel: interface on this gateway")
+    af.add_argument("--client-port", help="new client tunnel: proto/port, e.g. udp/11224")
+    af.add_argument("--client-subnet", help="new client tunnel: client subnet, e.g. 172.23.2.0/24")
+    af.add_argument("--no-client-tunnel", action="store_true", help="don't add a client tunnel for this FE")
+    af.add_argument("--carries", help="existing client tunnels whose clients also come in through this FE (comma-separated)")
+    rf = sub.add_parser("remove-fe", help="(gateway) remove an FE transport tunnel")
+    rf.add_argument("fe", help="name or interface of the transport tunnel to remove")
+    rf.add_argument("--dry-run", action="store_true", help="show the result; change nothing")
+    sub.add_parser("list-fe", help="show transport tunnels (and active clients per FE on a gateway)")
+    jn = sub.add_parser("join-nets", help="(gateway) let clients on these client subnets reach each other")
+    jn.add_argument("nets", nargs="?", help="comma-separated subnets, e.g. 172.23.1.0/24,172.23.2.0/24 (asked if omitted)")
+    jn.add_argument("--off", action="store_true", help="stop joining the subnets (removes the gateway's forward chain)")
+    jn.add_argument("--dry-run", action="store_true", help="show the result; change nothing")
+    sub.add_parser("render", help="print the ruleset for the saved config")
+    d = sub.add_parser("doctor", help="health-check firewall, transport tunnels, forwards and client tunnel")
+    d.add_argument("--fix", action="store_true", help="delete stale (un-NATed) conntrack flows")
+    for p in (s, ap_, af, rf, jn):
+        p.add_argument("--yes", "-y", action="store_true", help="don't ask before applying")
+        p.add_argument("--no-rollback", action="store_true", help="skip the confirm-or-rollback guard")
+        p.add_argument("--timeout", type=int, default=60, help="seconds to confirm before rollback (default 60)")
+    return ap
+
+
+def main():
+    ap = build_parser()
+    argv = sys.argv[1:]
+    commands = {"setup", "apply", "add-fe", "remove-fe", "list-fe", "render", "doctor", "join-nets"}
+    if not commands & set(argv) and not {"-h", "--help", "--version"} & set(argv):
+        # no subcommand: `tunnel-fw [--config X] [setup options]` means setup
+        i = 0
+        while i < len(argv) and (argv[i] == "--config" or argv[i].startswith("--config=")):
+            i += 1 if "=" in argv[i] else 2
+        argv = argv[:i] + ["setup"] + argv[i:]
+    args = ap.parse_args(argv)
+    cmd = args.cmd
+
+    try:
+        if cmd == "setup":
+            if not args.dry_run:
+                need_root("setup (use --dry-run to just preview)")
+            existing = load_config(args.config)
+            cfg = wizard(existing, detect())
+            summarize(cfg)
+            if args.dry_run:
+                dry_run_show(cfg)
+                return
+            if not ask_yn("Save this config and continue", True):
+                return
+            save_config(cfg, args.config)
+            ok(f"saved {args.config}")
+            apply(cfg, args.yes, args.no_rollback, args.timeout)
+            return
+
+        cfg = load_config(args.config)
+        if cfg is None:
+            die(f"no config at {args.config} - run `tunnel-fw setup` first")
+        if cmd == "apply":
+            summarize(cfg)
+            sys.exit(0 if apply(cfg, args.yes, args.no_rollback, args.timeout) else 1)
+        elif cmd == "render":
+            print(render(cfg), end="")
+        elif cmd == "doctor":
+            sys.exit(0 if doctor(cfg, args.fix, args.config) else 1)
+        elif cmd == "list-fe":
+            list_fe(cfg)
+        elif cmd in ("add-fe", "remove-fe", "join-nets"):
+            if not args.dry_run:
+                need_root(cmd)
+            if cmd == "add-fe":
+                new, gone = add_fe(cfg, args), None
+            elif cmd == "join-nets":
+                new, gone = join_nets(cfg, args), None
+            else:
+                new, gone = remove_fe(cfg, args.fe)
+            summarize(new)
+            if args.dry_run:
+                dry_run_show(new)
+                return
+            if not apply(new, args.yes, args.no_rollback, args.timeout):
+                info(f"{args.config} left unchanged")
+                sys.exit(1)
+            save_config(new, args.config)
+            ok(f"saved {args.config}")
+            if gone:
+                flush_removed_transport(gone, not args.yes)
+            if cmd == "join-nets" and not new.get("join_nets"):
+                info("net.ipv4.ip_forward was left on; to turn it off at boot, comment out "
+                     f"net.ipv4.ip_forward=1 in {SYSCTL_CONF}")
+    except KeyboardInterrupt:
+        print()
+        die("interrupted (if rules were already loaded and unconfirmed, the rollback guard will restore them)", 130)
+
+
+if __name__ == "__main__":
+    main()
